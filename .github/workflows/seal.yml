@@ -1,0 +1,68 @@
+name: Build portable Seal 0.6.14 key server
+on: workflow_dispatch
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      SEAL_REV: d5fc0f4a8c3a7fef9f7a3b19dcc1dfe6d99c8b2d
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTFLAGS: "-C target-cpu=x86-64 -C force-frame-pointers=yes -C force-unwind-tables=yes"
+      CC: gcc-11
+      CXX: g++-11
+      CFLAGS: "-march=x86-64 -mtune=generic"
+      CXXFLAGS: "-march=x86-64 -mtune=generic"
+    steps:
+      - name: Build and verify ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only on this disposable GitHub-hosted runner.
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-11 g++-11 libclang-15-dev libssl-dev libpq-dev cmake pkg-config unzip
+          df -h "$RUNNER_TEMP"
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 10737418240
+          rustup toolchain install 1.96.1 --profile minimal
+          cd "$RUNNER_TEMP"
+          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-linux-x86_64.zip -o protoc.zip
+          echo 'b24b53f87c151bfd48b112fe4c3a6e6574e5198874f38036aff41df3456b8caf  protoc.zip' | sha256sum -c -
+          unzip -q protoc.zip -d protoc
+          export PROTOC="$RUNNER_TEMP/protoc/bin/protoc" PROTOC_INCLUDE="$RUNNER_TEMP/protoc/include"
+          export LIBCLANG_PATH=/usr/lib/llvm-15/lib GIT_REVISION="$SEAL_REV"
+          git init -q seal-source
+          cd seal-source
+          git fetch --no-tags --depth=1 https://github.com/MystenLabs/seal.git "$SEAL_REV"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SEAL_REV"
+          echo 'e83f5330cb3b89f46264008a93198a4b5183604a75fcee297b42e5524c7afe79  Cargo.lock' | sha256sum -c -
+          cargo +1.96.1 build --locked --release --target x86_64-unknown-linux-gnu -p key-server --bin key-server
+          target=target/x86_64-unknown-linux-gnu/release
+          grep -h 'Compiling in portable mode without ISA extensions' "$target"/build/blst-*/output
+          if grep -hEq 'Enabling ADX|force-adx' "$target"/build/blst-*/output; then exit 1; fi
+          mkdir -p "$GITHUB_WORKSPACE/dist-seal"
+          install -m 755 "$target/key-server" "$GITHUB_WORKSPACE/dist-seal/key-server"
+          cd "$GITHUB_WORKSPACE/dist-seal"
+          ldd ./key-server | tee ldd.txt
+          if grep -q 'not found' ldd.txt; then exit 1; fi
+          readelf --version-info ./key-server > elf-versions.txt
+          max_glibc=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' elf-versions.txt | sort -Vu | tail -1)
+          test "$(printf '%s\n' "$max_glibc" GLIBC_2.36 | sort -V | tail -1)" = GLIBC_2.36
+          sha256sum key-server > SHA256SUMS
+          {
+            printf 'source=%s\nlock_sha256=%s\nseal=0.6.14\nrunner_image=%s\nflags=%s\nmax_glibc=%s\n' "$SEAL_REV" e83f5330cb3b89f46264008a93198a4b5183604a75fcee297b42e5524c7afe79 "${ImageVersion:-unknown}" "$RUSTFLAGS" "$max_glibc"
+            rustc +1.96.1 --version
+            "$CC" --version | head -1
+            getconf GNU_LIBC_VERSION
+            readelf -n ./key-server
+          } > provenance.txt
+      - name: Upload checksummed key server
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: seal-0.6.14-key-server-linux-amd64-portable
+          path: dist-seal/
+          if-no-files-found: error
+          retention-days: 7
