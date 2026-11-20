@@ -1,0 +1,71 @@
+name: Build portable Sui 1.74.1
+on: workflow_dispatch
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      SUI_REV: 8fc60f1fa966e90398c93beb67ad4f42992889c7
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO: "off"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTFLAGS: "-C target-cpu=x86-64 -C force-frame-pointers=yes -C force-unwind-tables=yes -A unknown_lints -A mismatched_lifetime_syntaxes"
+      CC: gcc-11
+      CXX: g++-11
+      CFLAGS: "-march=x86-64 -mtune=generic"
+      CXXFLAGS: "-march=x86-64 -mtune=generic"
+    steps:
+      - name: Build and verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Safe on this disposable GitHub-hosted runner only.
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-11 g++-11 libclang-15-dev libssl-dev libudev-dev cmake pkg-config unzip
+          df -h "$RUNNER_TEMP"
+          test "$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')" -ge 12884901888
+          rustup toolchain install 1.92.0 --profile minimal
+          cd "$RUNNER_TEMP"
+          curl --proto '=https' --proto-redir '=https' -fsSL --retry 3 https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-linux-x86_64.zip -o protoc.zip
+          echo 'b24b53f87c151bfd48b112fe4c3a6e6574e5198874f38036aff41df3456b8caf  protoc.zip' | sha256sum -c -
+          unzip -q protoc.zip -d protoc
+          export PROTOC="$RUNNER_TEMP/protoc/bin/protoc" PROTOC_INCLUDE="$RUNNER_TEMP/protoc/include"
+          export LIBCLANG_PATH=/usr/lib/llvm-15/lib
+          git init -q sui-source
+          cd sui-source
+          git fetch --no-tags --depth=1 https://github.com/MystenLabs/sui.git "$SUI_REV"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SUI_REV"
+          echo 'da4ee5e2f90d8a871661a7a591e1dd5f886145c5cca9ffc8d646d051fd95a2de  Cargo.lock' | sha256sum -c -
+          cargo +1.92.0 build --locked --release --target x86_64-unknown-linux-gnu -p sui --bin sui
+          target=target/x86_64-unknown-linux-gnu/release
+          grep -h 'Compiling in portable mode without ISA extensions' "$target"/build/blst-*/output
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          install -m 755 "$target/sui" "$GITHUB_WORKSPACE/dist/sui"
+          cd "$GITHUB_WORKSPACE/dist"
+          ldd ./sui | tee ldd.txt
+          if grep -q 'not found' ldd.txt; then exit 1; fi
+          readelf --version-info ./sui > elf-versions.txt
+          max_glibc=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' elf-versions.txt | sort -Vu | tail -1)
+          test "$(printf '%s\n' "$max_glibc" GLIBC_2.36 | sort -V | tail -1)" = GLIBC_2.36
+          version=$(./sui --version)
+          test "$version" = "sui 1.74.1-${SUI_REV:0:12}"
+          sha256sum sui > SHA256SUMS
+          {
+            printf 'source=%s\nlock_sha256=%s\nversion=%s\nrunner_image=%s\nflags=%s\nmax_glibc=%s\n' "$SUI_REV" da4ee5e2f90d8a871661a7a591e1dd5f886145c5cca9ffc8d646d051fd95a2de "$version" "${ImageVersion:-unknown}" "$RUSTFLAGS" "$max_glibc"
+            rustc +1.92.0 --version
+            "$CC" --version | head -1
+            getconf GNU_LIBC_VERSION
+            readelf -n ./sui
+          } > provenance.txt
+      - name: Upload checksummed binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sui-1.74.1-linux-amd64-portable
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
