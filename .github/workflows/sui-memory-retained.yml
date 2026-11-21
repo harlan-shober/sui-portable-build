@@ -1,0 +1,356 @@
+name: Sui scratch two-snapshot retention
+on:
+  push:
+    branches: [diagnostic/sui-retained-20261121]
+    paths: [.github/workflows/sui-memory-retained.yml]
+permissions: {}
+concurrency:
+  group: sui-scratch-retained
+  cancel-in-progress: false
+jobs:
+  profile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      actions: read
+    steps:
+      - name: Fetch exact existing portable build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sui-1.74.1-linux-amd64-portable
+          path: ${{ runner.temp }}/sui-memory-input
+          run-id: '44792562374'
+          github-token: ${{ github.token }}
+      - name: Install distro Heaptrack on the disposable runner
+        shell: bash
+        run: |
+          sudo apt-get -q update
+          sudo apt-get -qy install --no-install-recommends heaptrack
+          heaptrack --version
+      - name: Verify portable binary and prepare scratch harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          ulimit -c 0
+          test "$(uname -m)" = x86_64
+          test "$(id -u)" -ne 0
+          binary="$RUNNER_TEMP/sui-memory-input/sui"
+          test -f "$binary" && test ! -L "$binary"
+          printf '%s  %s\n' 8c5ad9388dd713a4ab5e993212e503e55c44ab1b6dce6ac3786cd8fa16002698 "$binary" | sha256sum --check --status
+          chmod 700 "$binary"
+          test "$(env -i PATH=/usr/bin:/bin "$binary" --version)" = 'sui 1.74.1-8fc60f1fa966'
+          getconf GNU_LIBC_VERSION
+          printf "ELF function table present: "
+          if readelf -SW "$binary" | grep -F " .symtab " >/dev/null; then echo yes; else echo no; fi
+          cat > "$RUNNER_TEMP/sui-retained.py" <<'PY'
+          import collections, os, pathlib, re, resource, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+          from contextlib import suppress
+
+          MiB = 1024 ** 2
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          binary = pathlib.Path(sys.argv[1]).resolve()
+          http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          silence = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+
+          def mem(path, item):
+              match = re.search(rf"(?m)^{item}:\s+([0-9]+)\s+kB$", path.read_text())
+              return int(match[1]) // 1024 if match else 0
+
+          def metrics(ports):
+              checkpoints = []
+              for port in ports:
+                  with suppress(OSError):
+                      with http.open(f"http://127.0.0.1:{port}/metrics", timeout=1) as resp:
+                          data = resp.read(8 * MiB)
+                      hit = re.search(rb"(?m)^last_certified_checkpoint ([0-9]+)(?:\.0+)?$", data)
+                      if hit:
+                          checkpoints.append(int(hit[1]))
+              return min(checkpoints) if len(checkpoints) == 4 else None
+
+          def cap():
+              resource.setrlimit(resource.RLIMIT_FSIZE, (768 * MiB, 768 * MiB))
+
+          def child_pid(pid):
+              with suppress(OSError):
+                  child_list = pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text()
+                  for child in map(int, child_list.split()):
+                      with suppress(OSError):
+                          if pathlib.Path(f"/proc/{child}/exe").resolve(strict=True) == binary:
+                              return child
+              return None
+
+          def safe_aggregate(path):
+              paths = collections.Counter()
+              for row in path.open(errors="replace"):
+                  stack, _, cost_s = row.rstrip("\n").rpartition(" ")
+                  if not re.fullmatch(r"[0-9]{1,15}", cost_s) or not int(cost_s):
+                      continue
+                  frames = []
+                  for raw in stack.split(";"):
+                      # Emit only probable public binary/library function names, never source paths,
+                      # addresses, labels, runtime args, or the raw profiler report.
+                      symbol = raw.strip().split(" in ", 1)[0]
+                      symbol = symbol.split("(", 1)[0].strip()
+                      if (re.fullmatch(r"[A-Za-z_][A-Za-z0-9_:$<>.,~& *-]{1,179}", symbol)
+                              and not re.search(r"(?:^|\s)0x[0-9a-fA-F]+|[0-9a-f]{32,}", symbol)):
+                          frames.append(symbol)
+                  key = " ; ".join(frames[-6:]) if frames else "[unresolved]"
+                  paths[key] += int(cost_s)
+              return paths
+
+          import gzip
+
+          TIMESTAMP = re.compile(rb"c ([0-9a-f]+)\n")
+
+          def split(source, early, late, start_ms, end_ms, max_bytes):
+              if not 0 < start_ms < end_ms or max_bytes <= 0:
+                  raise ValueError("invalid window")
+              seen, total, boundary = -1, 0, []
+              with gzip.open(early, "xb", compresslevel=1) as a, gzip.open(late, "xb", compresslevel=1) as b:
+                  for line in iter(lambda: source.readline(1 << 20), b""):
+                      last_total, total = total, total + len(line)
+                      if total // (64 * MiB) != last_total // (64 * MiB):
+                          if (shutil.disk_usage(early.parent).free < 2 * 1024 * MiB
+                                  or any(p.stat().st_size >= 768 * MiB for p in (early, late))):
+                              raise ValueError("prefix output guard")
+                      if total > max_bytes or not line.endswith(b"\n"):
+                          raise ValueError("oversized input or unfinished record")
+                      if len(boundary) < 1:
+                          a.write(line)
+                      if len(boundary) < 2:
+                          b.write(line)
+                      if line.startswith(b"c "):
+                          m = TIMESTAMP.fullmatch(line)
+                          if m is None:
+                              raise ValueError("invalid timestamp")
+                          value = int(m[1], 16)
+                          if value < seen:
+                              raise ValueError("nonmonotonic timestamps")
+                          seen = value
+                          if len(boundary) < 2 and value >= (start_ms, end_ms)[len(boundary)]:
+                              boundary.append(value)
+                              if len(boundary) == 1 and value >= end_ms:
+                                  raise ValueError("insufficient marker resolution")
+                  if len(boundary) != 2:
+                      raise ValueError("trace did not reach both endpoints")
+              return boundary
+
+
+          def snapshots(trace, work, t0, t1, env):
+              early, late = work / "early.gz", work / "late.gz"
+              tool = ["zstd", "-qdc", "--"] if trace.suffix == ".zst" else ["gzip", "-dc", "--"]
+              decoder = subprocess.Popen([*tool, str(trace)], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+              try:
+                  markers = split(decoder.stdout, early, late, t0, t1, 12 * 1024 * MiB)
+                  if decoder.wait(timeout=10):
+                      raise ValueError("trace decoder failed")
+              finally:
+                  decoder.stdout.close()
+                  if decoder.poll() is None:
+                      decoder.kill()
+                      decoder.wait(timeout=10)
+
+              def analyze(prefix):
+                  if shutil.disk_usage(work).free < 2 * 1024 * MiB:
+                      raise ValueError("snapshot parser disk guard")
+                  folded = work / "snapshot.folded"
+                  with suppress(FileNotFoundError):
+                      folded.unlink()
+                  result = subprocess.run(["prlimit", f"--as={8 * 1024 * MiB}", f"--fsize={512 * MiB}", "--",
+                                           "heaptrack_print", "--file", str(prefix), "--print-peaks=false",
+                                           "--print-allocators=false", "--print-temporary=false", "--print-leaks=false",
+                                           "--disable-embedded-suppressions", "--disable-builtin-suppressions",
+                                           "--flamegraph-cost-type", "leaked", "--print-flamegraph", str(folded)],
+                                          cwd=work, env=env, timeout=180, **silence)
+                  if result.returncode or not folded.is_file():
+                      raise ValueError("snapshot analyzer failed")
+                  aggregate = safe_aggregate(folded)
+                  if not aggregate:
+                      raise ValueError("snapshot aggregation empty")
+                  folded.unlink()
+                  prefix.unlink()
+                  return aggregate
+
+              a, b = analyze(early), analyze(late)
+              delta = b.copy()
+              delta.subtract(a)  # Keep negative values from frees.
+              return a, b, delta, markers
+
+          def calibrate():
+              with tempfile.TemporaryDirectory(prefix="sui-calibration-", dir=root) as path:
+                  w = pathlib.Path(path)
+                  env = {"PATH": "/usr/bin:/bin", "HOME": path, "TMPDIR": path, "LANG": "C", "DEBUGINFOD_URLS": ""}
+                  c = w / "fixture.c"
+                  exe = w / "fixture"
+                  c.write_text(r"""
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+          __attribute__((noinline)) void *allocate_early(void) {
+              void *p = malloc(8 * 1024 * 1024);
+              if (!p) _Exit(2);
+              memset(p, 1, 8 * 1024 * 1024);
+              __asm__ volatile ("" : : "r"(p) : "memory");
+              return p;
+          }
+          __attribute__((noinline)) void *allocate_late(void) {
+              void *p = malloc(12 * 1024 * 1024);
+              if (!p) _Exit(2);
+              memset(p, 2, 12 * 1024 * 1024);
+              __asm__ volatile ("" : : "r"(p) : "memory");
+              return p;
+          }
+          int main(void) {
+              void *a = allocate_early();
+              sleep(3);
+              free(a);
+              void *b = allocate_late();
+              sleep(4);
+              free(b);
+              return 0;
+          }
+          """)
+                  subprocess.run(["cc", "-O0", "-g", "-fno-omit-frame-pointer", "-o", str(exe), str(c)],
+                                 check=True, env=env, cwd=w, timeout=25, **silence)
+                  subprocess.run(["heaptrack", "--record-only", "-o", str(w / "fixture-profile"), str(exe)],
+                                 check=True, env=env, cwd=w, timeout=30, **silence)
+                  traces = [p for p in w.glob("fixture-profile.*") if p.suffix in (".zst", ".gz") and p.stat().st_size]
+                  if len(traces) != 1:
+                      return False
+                  a, b, delta, marks = snapshots(traces[0], w, 2000, 5000, env)
+                  def stack_sum(costs, name):
+                      return sum(v for k, v in costs.items() if name in k.split(" ; "))
+                  return (marks[0] < 2800 and marks[1] < 6500
+                          and stack_sum(a, "allocate_early") == 8 * MiB and stack_sum(b, "allocate_early") == 0
+                          and stack_sum(a, "allocate_late") == 0 and stack_sum(b, "allocate_late") == 12 * MiB
+                          and stack_sum(delta, "allocate_early") == -8 * MiB
+                          and stack_sum(delta, "allocate_late") == 12 * MiB)
+
+          def main():
+              if shutil.disk_usage(root).free < 6 * 1024 * MiB:
+                  print("profile outcome=preflight-disk")
+                  return 1
+              print("Fresh scratch; 4 validators only; 60s epochs; no client/faucet/fullnode; Heaptrack from launch", flush=True)
+              with tempfile.TemporaryDirectory(prefix="sui-profile-", dir=root) as path:
+                  scratch = pathlib.Path(path)
+                  config = scratch / "config"
+                  config.mkdir()
+                  env = {"PATH": "/usr/bin:/bin", "HOME": path, "TMPDIR": path,
+                         "LANG": "C", "RUST_LOG": "error", "DEBUGINFOD_URLS": ""}
+                  subprocess.run([str(binary), "genesis", "--working-dir", str(config), "--committee-size", "4",
+                                  "--epoch-duration-ms", "60000"], cwd=path, env=env,
+                                 check=True, timeout=120, **silence)
+                  ports = [int(p) for p in re.findall(r"(?m)^\s+metrics-address: ['\"]?(?:127\.0\.0\.1|0\.0\.0\.0):([0-9]+)",
+                                                       (config / "network.yaml").read_text())]
+                  proc = subprocess.Popen(["heaptrack", "--record-only", "-o", str(scratch / "profile"),
+                                           str(binary), "start", "--network.config", str(config), "--no-full-node"],
+                                          cwd=path, env=env, start_new_session=True, preexec_fn=cap, **silence)
+                  started, next_sample, peak_anon = time.monotonic(), 0, 0
+                  cp_first = cp_last = None
+                  rss_samples = []
+                  outcome, graceful = "unknown", False
+                  try:
+                      while proc.poll() is None:
+                          elapsed = int(time.monotonic() - started)
+                          pid = child_pid(proc.pid)
+                          if elapsed >= 45 and pid is None:
+                              outcome = "traced-process-unavailable"
+                              break
+                          rss = anon = 0
+                          if pid is not None:
+                              status = pathlib.Path(f"/proc/{pid}/status")
+                              with suppress(OSError):
+                                  rss, anon = mem(status, "VmRSS"), mem(status, "RssAnon")
+                          peak_anon = max(peak_anon, anon)
+                          trace_bytes = sum(p.stat().st_size for p in scratch.glob("profile.*") if p.is_file())
+                          if elapsed >= next_sample:
+                              cp = metrics(ports) if len(ports) == 4 else None
+                              rss_samples.append((elapsed, anon, cp))
+                              if cp is not None:
+                                  cp_first = cp if cp_first is None else cp_first
+                                  cp_last = cp
+                              print(f"elapsed_s={elapsed} rss_MiB={rss} anon_MiB={anon} min_checkpoint={cp} trace_MiB={trace_bytes // MiB}", flush=True)
+                              next_sample += 12
+                          if trace_bytes >= 640 * MiB:
+                              outcome = "trace-soft-cap"
+                              break
+                          if rss >= 8 * 1024 or mem(pathlib.Path("/proc/meminfo"), "MemAvailable") < 3 * 1024:
+                              outcome = "ram-headroom"
+                              break
+                          if shutil.disk_usage(root).free < 3 * 1024 * MiB:
+                              outcome = "disk-headroom"
+                              break
+                          if elapsed >= 12 * 60:
+                              outcome = "window-complete"
+                              break
+                          time.sleep(4)
+                      else:
+                          outcome = f"profiler-exit-{proc.returncode}"
+                  finally:
+                      pid = child_pid(proc.pid) if proc.poll() is None else None
+                      if pid is not None:
+                          with suppress(ProcessLookupError):
+                              os.kill(pid, signal.SIGINT)
+                          with suppress(subprocess.TimeoutExpired):
+                              graceful = proc.wait(timeout=20) == 0
+                      if proc.poll() is None:
+                          with suppress(ProcessLookupError):
+                              os.killpg(proc.pid, signal.SIGKILL)
+                          proc.wait(timeout=10)
+                  print(f"profile outcome={outcome} graceful_stop={str(graceful).lower()} peak_anon_MiB={peak_anon} checkpoint_start={cp_first} checkpoint_end={cp_last}", flush=True)
+                  traces = [p for p in scratch.glob("profile.*") if p.suffix in (".gz", ".zst") and p.stat().st_size > 0]
+                  if len(traces) != 1:
+                      print("profile-analysis outcome=no-single-trace")
+                      return 1
+                  if not graceful or cp_first is None or cp_last <= cp_first:
+                      print("snapshot-analysis outcome=inconclusive-capture")
+                      return 1
+                  _early, _late, delta, markers = snapshots(traces[0], scratch, 120000, 660000, env)
+                  advancing_samples = [row for row in rss_samples if row[2] is not None and row[1] > 0]
+                  start_row, end_row = [min(advancing_samples, key=lambda row: abs(row[0] * 1000 - marker)) for marker in markers]
+                  if (end_row[2] <= start_row[2]
+                          or any(abs(row[0] * 1000 - marker) > 18000 for row, marker in zip((start_row, end_row), markers))):
+                      print("snapshot-analysis outcome=inconclusive-alignment")
+                      return 1
+                  print(f"markers_ms={markers[0]},{markers[1]} nearby_samples_s={start_row[0]},{end_row[0]} "
+                        f"checkpoint_delta={end_row[2]-start_row[2]} anon_delta_MiB={end_row[1]-start_row[1]}")
+                  print(f"tracked_early_B={sum(_early.values())} tracked_late_B={sum(_late.values())} "
+                        f"tracked_delta_B={sum(delta.values())} unresolved_delta_B={delta.get('[unresolved]', 0)}")
+                  for direction in (1, -1):
+                      changes = sorted(((key, val) for key, val in delta.items() if val * direction > 0),
+                                       key=lambda pair: -abs(pair[1]))
+                      for key, val in changes[:8]:
+                          print(f"tracked_delta_B={val:+d} stack={key}")
+                  print("snapshot-analysis outcome=verified; outstanding tracked allocation bytes, not leaks or all RSS/mmap")
+                  return 0
+
+          if __name__ == "__main__":
+              try:
+                  if sys.argv[2] == "calibrate":
+                      if not calibrate():
+                          print("calibration outcome=failed")
+                          sys.exit(1)
+                      print("calibration outcome=verified -8MiB early +12MiB late net +4MiB fixture allocations", flush=True)
+                      sys.exit(0)
+                  if sys.argv[2] != "capture":
+                      raise ValueError("invalid local workflow mode")
+                  sys.exit(main())
+              except (OSError, ValueError, subprocess.SubprocessError):
+                  print("profile-analysis outcome=bounded-step-failed")
+                  sys.exit(1)
+          PY
+      - name: Calibrate known allocation and free
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          ulimit -c 0
+          python3 "$RUNNER_TEMP/sui-retained.py" "$RUNNER_TEMP/sui-memory-input/sui" calibrate
+      - name: Capture Sui two-snapshot test
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          ulimit -c 0
+          python3 "$RUNNER_TEMP/sui-retained.py" "$RUNNER_TEMP/sui-memory-input/sui" capture
