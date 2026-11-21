@@ -1,0 +1,221 @@
+name: Sui scratch default-path memtable budget
+on:
+  push:
+    branches: [diagnostic/sui-memtable-20261121]
+    paths: [.github/workflows/sui-memtable-ab.yml]
+permissions: {}
+concurrency:
+  group: sui-scratch-memtable-ab
+  cancel-in-progress: false
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 115
+    permissions:
+      actions: read
+    steps:
+      - name: Fetch exact existing portable build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sui-1.74.1-linux-amd64-portable
+          path: ${{ runner.temp }}/sui-memtable-input
+          run-id: '44792562374'
+          github-token: ${{ github.token }}
+      - name: Compare default-path budget in two fresh 24-hour epoch swarms
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          ulimit -c 0
+          test "$(uname -m)" = x86_64
+          test "$(id -u)" -ne 0
+          binary="$RUNNER_TEMP/sui-memtable-input/sui"
+          test -f "$binary" && test ! -L "$binary"
+          printf '%s  %s\n' 8c5ad9388dd713a4ab5e993212e503e55c44ab1b6dce6ac3786cd8fa16002698 "$binary" | sha256sum --check --status
+          chmod 700 "$binary"
+          test "$(env -i PATH=/usr/bin:/bin "$binary" --version)" = 'sui 1.74.1-8fc60f1fa966'
+          getconf GNU_LIBC_VERSION
+          python3 - "$binary" <<'PY'
+          import collections, os, pathlib, re, shutil, signal, subprocess, sys, tempfile, time
+          import urllib.request
+          from contextlib import suppress
+          from decimal import Decimal
+
+          MiB = 1024**2
+          root = pathlib.Path(os.environ["RUNNER_TEMP"])
+          binary = str(pathlib.Path(sys.argv[1]).resolve())
+          http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          silence = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+          proc_metric = re.compile(rb"(?m)^(last_executed_checkpoint|last_certified_checkpoint|checkpoint_exec_epoch) ([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]{1,2})?)$")
+          cf_metric = re.compile(rb'(?m)^rocksdb_(current_size_active_mem_tables|size_all_mem_tables|num_immutable_mem_tables|mem_table_flush_pending)\{cf_name="([a-zA-Z0-9_]+)"\} ([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]{1,2})?)$')
+          env_key = "DB_WRITE_BUFFER_SIZE_MB"
+          # CF labels lack DB identity. Selected CFs are examples, never summed across CF/DB.
+          watched_cf = {b"objects", b"transactions", b"effects", b"signed_transactions", b"consensus_blocks", b"checkpoints"}
+
+          def kib(path, key):
+              m = re.search(rf"(?m)^{key}:\s+([0-9]+)\s+kB$", path.read_text())
+              return int(m[1]) if m else None
+
+          def safe_headroom():
+              available = kib(pathlib.Path("/proc/meminfo"), "MemAvailable")
+              return available is not None and available >= 2 * 1024**2 and shutil.disk_usage(root).free >= 2 * 1024 * MiB
+
+          def scrape(ports):
+              rows = []
+              for port in ports:
+                  try:
+                      with http.open(f"http://127.0.0.1:{port}/metrics", timeout=1) as f:
+                          payload = f.read(8 * MiB)
+                  except OSError:
+                      rows.append(({}, {}))
+                      continue
+                  p = {k.decode(): int(Decimal(v.decode())) for k, v in proc_metric.findall(payload)}
+                  c = {(k.decode(), cf.decode()): int(Decimal(v.decode())) for k, cf, v in cf_metric.findall(payload) if cf in watched_cf}
+                  rows.append((p, c))
+              return rows
+
+          def group(path):
+              name = path.name
+              if name == "perpetual":
+                  return "authority-perpetual"
+              if re.fullmatch(r"epoch_[0-9]+", name):
+                  return "epoch-directory" # Could be authority or another epoch-specific DB.
+              return "other"
+
+          def inventory(configs, label, budget_mib, phase, logs=False):
+              wanted = budget_mib * MiB
+              counts = collections.Counter()
+              flushes = collections.Counter()
+              latest = {}
+              for opt in configs.rglob("OPTIONS-*"):
+                  if not re.fullmatch(r"OPTIONS-[0-9]+", opt.name) or not opt.is_file() or opt.is_symlink():
+                      continue
+                  prev = latest.get(opt.parent)
+                  if prev is None or int(opt.name.split("-")[1]) > int(prev.name.split("-")[1]):
+                      latest[opt.parent] = opt
+                  if len(latest) >= 256:
+                      raise ValueError("database inventory cap")
+              for path, opt in latest.items():
+                  if opt.stat().st_size > MiB:
+                      raise ValueError("options size cap")
+                  opts = opt.read_text(errors="replace")
+                  m = re.search(r"(?m)^\s*db_write_buffer_size\s*=\s*([0-9]+)\s*$", opts)
+                  w = re.search(r"(?m)^\s*max_total_wal_size\s*=\s*([0-9]+)\s*$", opts)
+                  value = int(m[1]) if m else None
+                  wal = int(w[1]) if w else None
+                  g = group(path)
+                  counts[g, value, wal] += 1
+                  if logs:
+                      # Only numeric counts from a bounded trailing slice. This is not a total or proof of memory retained.
+                      for log in (path / "LOG",):
+                          with suppress(OSError):
+                              with log.open("rb") as f:
+                                  f.seek(max(0, log.stat().st_size - 512 * 1024))
+                                  block = f.read(512 * 1024)
+                              flushes[g, value, "sampled"] += 1
+                              flushes[g, value, "flush_started"] += len(re.findall(rb'"event"\s*:\s*"flush_started"', block))
+                              flushes[g, value, "writebuffer_manager_mentions"] += len(re.findall(rb'(?i)write[ _-]*buffer[ _-]*manager', block))
+              for (g, val, wal), n in sorted(counts.items(), key=lambda row: (row[0][0], row[0][1] or 0, row[0][2] or 0)):
+                  print(f"{label} phase={phase} group={g} db_write_buffer_bytes={val} max_total_wal_bytes={wal} db_count={n}", flush=True)
+              for (g, val, key), n in sorted(flushes.items(), key=lambda row: (row[0][0], row[0][1] or 0, row[0][2])):
+                  print(f"{label} group={g} db_write_buffer_bytes={val} trailing_log_{key}={n}", flush=True)
+              return any(val == wanted and g != "authority-perpetual" for g, val, _wal in counts)
+
+          def stop(proc):
+              if proc.poll() is not None:
+                  return
+              with suppress(ProcessLookupError):
+                  os.killpg(proc.pid, signal.SIGINT)
+              try:
+                  proc.wait(timeout=15)
+              except subprocess.TimeoutExpired:
+                  with suppress(ProcessLookupError):
+                      os.killpg(proc.pid, signal.SIGKILL)
+                  proc.wait(timeout=10)
+
+          def run_case(label, budget_mib, override):
+              if not safe_headroom() or shutil.disk_usage(root).free < 5 * 1024 * MiB:
+                  return "resource-preflight"
+              with tempfile.TemporaryDirectory(prefix="sui-memtable-", dir=root) as path:
+                  configs = pathlib.Path(path) / "config"
+                  configs.mkdir()
+                  env = {"PATH": "/usr/bin:/bin", "HOME": path, "TMPDIR": path, "RUST_LOG": "error"}
+                  if override:
+                      env[env_key] = str(budget_mib)
+                  g = subprocess.run([binary, "genesis", "--working-dir", str(configs),
+                                      "--committee-size", "4", "--epoch-duration-ms", "86400000"],
+                                     cwd=path, env=env, timeout=120, **silence)
+                  if g.returncode:
+                      return f"genesis-exit-{g.returncode}"
+                  ports = [int(p) for p in re.findall(r"(?m)^\s+metrics-address: ['\"]?(?:127\.0\.0\.1|0\.0\.0\.0):([0-9]+)",
+                                                     (configs / "network.yaml").read_text())]
+                  if len(ports) != 4 or len(set(ports)) != 4:
+                      return "metrics-addresses-unavailable"
+                  proc = subprocess.Popen([binary, "start", "--network.config", str(configs), "--no-full-node"],
+                                          cwd=path, env=env, start_new_session=True, **silence)
+                  started, sample, first = time.monotonic(), 0, None
+                  terminal, changed = None, False
+                  outcome = "unknown"
+                  try:
+                      while proc.poll() is None:
+                          elapsed = int(time.monotonic() - started)
+                          status = pathlib.Path(f"/proc/{proc.pid}/status")
+                          rss = anon = None
+                          with suppress(FileNotFoundError):
+                              rss = kib(status, "VmRSS")
+                              anon = kib(status, "RssAnon")
+                          if rss is None or anon is None:
+                              outcome = "process-memory-unavailable"
+                              break
+                          if elapsed >= sample:
+                              rows = scrape(ports)
+                              keys = ("last_executed_checkpoint", "last_certified_checkpoint", "checkpoint_exec_epoch")
+                              if all(all(k in p for k in keys) for p, _ in rows):
+                                  minima = [min(p[k] for p, _ in rows) for k in keys]
+                                  epochs = [p[keys[2]] for p, _ in rows]
+                                  first = minima if first is None else first
+                                  terminal = minima
+                                  print(f"{label} elapsed_s={elapsed} rss_MiB={rss // 1024} anon_MiB={anon // 1024} min_executed={minima[0]} min_certified={minima[1]} epoch_range={min(epochs)}:{max(epochs)}", flush=True)
+                                  if max(epochs) != 0:
+                                      outcome = "unexpected-epoch-transition"
+                                      break
+                              else:
+                                  print(f"{label} elapsed_s={elapsed} rss_MiB={rss // 1024} anon_MiB={anon // 1024} progress=unavailable", flush=True)
+                              if sample % 300 == 0:
+                                  for i, (_, cf_values) in enumerate(rows):
+                                      for (metric, cf), value in sorted(cf_values.items()):
+                                          print(f"{label} elapsed_s={elapsed} validator={i} cf_only={cf} {metric}={value}", flush=True)
+                              sample += 60
+                          if not changed and elapsed >= 180:
+                              changed = inventory(configs, label, budget_mib, "initial")
+                              if not changed:
+                                  outcome = "expected-DB-budget-not-observed"
+                                  break
+                          if rss >= 11.5 * 1024**2 or not safe_headroom():
+                              outcome = "resource-guard"
+                              break
+                          if elapsed >= 45 * 60:
+                              outcome = "window-complete"
+                              break
+                          time.sleep(4)
+                      else:
+                          outcome = f"sui-exit-{proc.returncode}"
+                      again = inventory(configs, label, budget_mib, "final-live", logs=True)
+                      if not changed or not again or first is None or terminal is None or terminal[0] <= first[0]:
+                          return f"inconclusive-{outcome}"
+                      return outcome
+                  finally:
+                      stop(proc)
+
+          print("24-hour scratch epochs; 4 validators; no fullnode, faucet, or external clients. Only default-path RocksDBs use the env setting; authority perpetual and known epoch-store overrides remain unchanged.", flush=True)
+          print("CF gauges are selected per-validator cf_name observations, not a per-DB sum. No flush-error audit. Flush counts are bounded trailing-LOG samples, not totals. Options prove config, not that live memtable bytes reached the limit.", flush=True)
+          outcomes = []
+          for args in (("default-path-default", 1024, False), ("default-path-64MiB", 64, True)):
+              try:
+                  outcome = run_case(*args)
+              except (OSError, ValueError, subprocess.SubprocessError):
+                  outcome = "diagnostic-error"
+              outcomes.append(outcome)
+              print(f"{args[0]} outcome={outcome}", flush=True)
+          sys.exit(any(outcome != "window-complete" for outcome in outcomes))
+          PY
